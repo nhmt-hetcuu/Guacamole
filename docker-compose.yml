@@ -1,0 +1,145 @@
+# Cấu hình log dùng chung cho mọi service
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Nhãn để Watchtower của stack này tự cập nhật service
+x-autoupdate: &autoupdate
+  com.centurylinklabs.watchtower.scope: guacamole
+
+# Tạo mạng nội bộ riêng giúp bảo mật và giao tiếp nhanh hơn
+networks:
+  guac_network:
+    name: guac_network
+    driver: bridge
+
+services:
+  # ----------------------------------------------------
+  # 0. INITDB (chạy 1 lần rồi thoát)
+  # Sinh script tạo bảng ra ./init/initdb.sql cho PostgreSQL
+  # ----------------------------------------------------
+  guac-initdb:
+    image: guacamole/guacamole:${GUAC_VERSION}
+    container_name: guac_initdb
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        set -e;
+        if [ ! -s /init/initdb.sql ]; then
+          /opt/guacamole/bin/initdb.sh --postgresql > /init/initdb.sql.tmp;
+          mv /init/initdb.sql.tmp /init/initdb.sql;
+        fi
+    volumes:
+      - ./init:/init
+    restart: "no"
+    logging: *logging
+
+  # ----------------------------------------------------
+  # 1. POSTGRESQL (Lưu user, connection, lịch sử)
+  # Script trong ./init chỉ chạy khi volume dữ liệu còn trống
+  # ----------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: guac_postgres
+    restart: unless-stopped
+    depends_on:
+      guac-initdb:
+        condition: service_completed_successfully
+    volumes:
+      # Volume Docker thay vì thư mục ổ Z: — tránh lỗi quyền thư mục dữ liệu của PostgreSQL
+      - guac_db:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - TZ=Asia/Ho_Chi_Minh
+    healthcheck:
+      # -h 127.0.0.1: chỉ báo sẵn sàng khi đã chạy xong script khởi tạo
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - guac_network
+    labels: *autoupdate
+    logging: *logging
+
+  # ----------------------------------------------------
+  # 2. GUACD (Proxy kết nối RDP / VNC / SSH / Telnet)
+  # Không mở cổng ra ngoài, chỉ web Guacamole gọi tới
+  # ----------------------------------------------------
+  guacd:
+    image: guacamole/guacd:${GUAC_VERSION}
+    container_name: guac_guacd
+    restart: unless-stopped
+    environment:
+      # Bật log chi tiết khi cần dò lỗi: GUACD_LOG_LEVEL=debug docker compose up -d guacd
+      - GUACD_LOG_LEVEL=${GUACD_LOG_LEVEL:-info}
+      - TZ=Asia/Ho_Chi_Minh
+    networks:
+      - guac_network
+    labels: *autoupdate
+    logging: *logging
+
+  # ----------------------------------------------------
+  # 3. GUACAMOLE (Giao diện web)
+  # Nginx (ngoài Docker) đứng trước, trỏ vào cổng GUAC_PORT
+  # ----------------------------------------------------
+  guacamole:
+    image: guacamole/guacamole:${GUAC_VERSION}
+    container_name: guacamole
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      guacd:
+        condition: service_started
+    ports:
+      - "${GUAC_PORT}:8080"
+    environment:
+      - GUACD_HOSTNAME=guacd
+      - GUACD_PORT=4822
+      - POSTGRESQL_ENABLED=true
+      - POSTGRESQL_HOSTNAME=postgres
+      - POSTGRESQL_PORT=5432
+      - POSTGRESQL_DATABASE=${POSTGRES_DB}
+      - POSTGRESQL_USERNAME=${POSTGRES_USER}
+      - POSTGRESQL_PASSWORD=${POSTGRES_PASSWORD}
+      - TOTP_ENABLED=${TOTP_ENABLED}
+      - TOTP_ISSUER=${TOTP_ISSUER}
+      # Chạy ở / thay vì /guacamole/
+      - WEBAPP_CONTEXT=ROOT
+      # Tin header X-Forwarded-* từ Nginx (IP nội bộ) để ghi đúng IP người dùng
+      - REMOTE_IP_VALVE_ENABLED=true
+      - TZ=Asia/Ho_Chi_Minh
+    networks:
+      - guac_network
+    labels: *autoupdate
+    logging: *logging
+
+  # ----------------------------------------------------
+  # 4. WATCHTOWER (Tự động cập nhật Image)
+  # Chỉ cập nhật service có nhãn scope "guacamole" (postgres, guacd, guacamole).
+  # Image Guacamole giữ tag ${GUAC_VERSION} nên chỉ nhận bản vá của đúng phiên bản đó;
+  # lên phiên bản mới thì đổi GUAC_VERSION bằng tay vì có thể phải nâng cấp schema DB.
+  # Chạy lúc 4h sáng để không làm rớt phiên remote đang dùng.
+  # ----------------------------------------------------
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: guac_watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_API_VERSION=1.40  # Khớp với yêu cầu của Docker Host
+      - TZ=Asia/Ho_Chi_Minh
+    command: --schedule "0 0 4 * * *" --cleanup --scope guacamole
+    labels: *autoupdate
+    logging: *logging
+
+volumes:
+  guac_db:

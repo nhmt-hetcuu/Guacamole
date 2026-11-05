@@ -1,0 +1,7 @@
+# Mật khẩu và biến môi trường
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+.DS_Store
